@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -29,6 +30,16 @@ def default_portal_url() -> str:
         f"http://{PORTAL_HOST}:{PORTAL_PAGE_PORT}/a79.htm"
         f"?wlanacname={DEFAULT_WLAN_AC_NAME}&ssid={DEFAULT_SSID}"
     )
+
+
+_SECRET_QS = re.compile(
+    r"(user_password|password|passwd|pwd|upass)=([^&\s)'\"]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: str) -> str:
+    return _SECRET_QS.sub(r"\1=***", text or "")
 
 
 # 这些是你电脑当时的地址，每次拨号都会变，不能写死在配置里

@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from config import APP_NAME, DEFAULT_WLAN_AC_NAME, PORTAL_HOST
+from config import APP_NAME, DEFAULT_WLAN_AC_NAME, PORTAL_HOST, redact_secrets
 
 log = logging.getLogger(APP_NAME)
 
@@ -428,7 +428,7 @@ def login_drcom_portal(session: requests.Session, url: str, html: str, username:
                     headers={"Referer": url, "Accept": "*/*"},
                 )
             except requests.RequestException as exc:
-                last_message = f"认证接口暂不可达: {exc}"
+                last_message = f"认证接口暂不可达: {redact_secrets(str(exc))}"
                 log.info(last_message)
                 return False, last_message
             raw = response.content or b""

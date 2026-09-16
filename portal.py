@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import adapters
-from config import APP_NAME, PORTAL_HOST, PORTAL_PAGE_PORT, AppConfig, default_portal_url, load_config
+from config import APP_NAME, PORTAL_HOST, AppConfig, default_portal_url, load_config, redact_secrets
 from credentials import load_password
 
 log = logging.getLogger(APP_NAME)
@@ -48,47 +48,6 @@ class LoginResult:
 def _portal_host() -> str:
     host = urlparse(load_config().normalized_portal_url()).hostname
     return host or PORTAL_HOST
-
-
-def _is_school_portal(url: str, text: str = "") -> bool:
-    combined = f"{url}\n{text}".lower()
-    return (
-        PORTAL_HOST in combined
-        or "a79.htm" in combined
-        or "wlanacname=" in combined
-        or "/eportal/" in combined
-        or "dr.comwebloginid" in combined
-    )
-
-
-def discover_portal_url(session: requests.Session | None = None) -> str:
-    """未认证时跟随系统探测跳转，拿到当前的 wlanacname / 客户端 IP；失败则用学校默认地址。"""
-    fallback = default_portal_url()
-    own_session = session is None
-    session = session or _new_session()
-    probes = (
-        "http://www.msftconnecttest.com/redirect",
-        f"http://{PORTAL_HOST}:{PORTAL_PAGE_PORT}/a79.htm",
-    )
-    try:
-        for probe in probes:
-            try:
-                response = _request(session, "GET", probe, timeout=FAST_TIMEOUT, allow_redirects=True)
-            except requests.RequestException as exc:
-                log.info("探测登录页失败 %s: %s", probe, exc)
-                continue
-            final_url = response.url or ""
-            html = response.text or ""
-            if _is_school_portal(final_url, html) and "wlanacname=" in final_url.lower():
-                log.info("发现登录页: %s", final_url)
-                return final_url
-            if _is_school_portal(final_url, html) and "a79.htm" in final_url.lower():
-                log.info("发现登录入口: %s", final_url)
-                return final_url
-        return fallback
-    finally:
-        if own_session:
-            session.close()
 
 
 def _new_session() -> requests.Session:
@@ -221,8 +180,8 @@ def submit_login(
         ok, message, kind = adapters.login(session, portal_url, "", username, password)
         return LoginResult(ok, message, kind)
     except requests.RequestException as exc:
-        log.info("认证接口暂不可达: %s", exc)
-        return LoginResult(False, f"认证接口暂不可达: {exc}")
+        log.info("认证接口暂不可达: %s", redact_secrets(str(exc)))
+        return LoginResult(False, f"认证接口暂不可达: {redact_secrets(str(exc))}")
     except Exception as exc:
         log.exception("登录过程出错")
         return LoginResult(False, f"登录出错: {exc}")
@@ -250,8 +209,7 @@ def submit_logout(portal_url: str, username: str) -> LoginResult:
 
 def run_logout() -> LoginResult:
     cfg = load_config()
-    portal_url = discover_portal_url()
-    return submit_logout(portal_url, cfg.username.strip())
+    return submit_logout(default_portal_url(), cfg.username.strip())
 
 
 def run_login_loop(
@@ -273,7 +231,7 @@ def run_login_loop(
     session = _new_session()
     last = LoginResult(False, "尚未尝试登录")
     try:
-        portal_url = discover_portal_url(session)
+        portal_url = default_portal_url()
         for pos, index in enumerate(indexes):
             started = time.perf_counter()
             last = submit_login(portal_url, username, password, session=session)
