@@ -32,9 +32,11 @@ class SetupApp(tk.Tk):
         ttk.Label(frame, text=f"{SCHOOL_NAME}校园网自动登录", font=("", 12, "bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4)
         )
-        ttk.Label(frame, text="只需填写账号和密码，认证地址已内置。", foreground="#555").grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8)
-        )
+        ttk.Label(
+            frame,
+            text="账号为你的手机号，密码就是你最后一次获取的验证码。",
+            foreground="#555",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
 
         ttk.Label(frame, text="账号").grid(row=2, column=0, sticky="e", **pad)
         self.user_var = tk.StringVar(value=cfg.username)
@@ -46,21 +48,16 @@ class SetupApp(tk.Tk):
         self.pass_entry = ttk.Entry(frame, textvariable=self.pass_var, width=36, show="*")
         self.pass_entry.grid(row=3, column=1, columnspan=3, sticky="we", **pad)
 
-        hint = "点「保存并连接」后会立即登录，并在每次开机时自动连接校园网。密码保存在 Windows 凭据管理器，不会明文写入配置文件。"
-        ttk.Label(frame, text=hint, wraplength=420, foreground="#555").grid(
-            row=4, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8)
-        )
-
         self.save_btn = ttk.Button(frame, text="保存并连接", command=self.on_save)
-        self.save_btn.grid(row=5, column=1, sticky="we", **pad)
+        self.save_btn.grid(row=4, column=1, sticky="we", **pad)
         self.logout_btn = ttk.Button(frame, text="断开校园网", command=self.on_logout)
-        self.logout_btn.grid(row=5, column=2, sticky="we", **pad)
+        self.logout_btn.grid(row=4, column=2, sticky="we", **pad)
         self.uninstall_btn = ttk.Button(frame, text="卸载开机任务", command=self.on_uninstall)
-        self.uninstall_btn.grid(row=5, column=3, sticky="we", **pad)
+        self.uninstall_btn.grid(row=4, column=3, sticky="we", **pad)
 
         self.status_var = tk.StringVar(value=self._status_text())
         ttk.Label(frame, textvariable=self.status_var, wraplength=420).grid(
-            row=6, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 0)
+            row=5, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 0)
         )
 
         self.bind("<Return>", lambda _event: self.on_save())
