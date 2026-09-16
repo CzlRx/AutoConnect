@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import adapters
-from config import APP_NAME, AppConfig, load_config
+from config import APP_NAME, PORTAL_HOST, PORTAL_PAGE_PORT, AppConfig, default_portal_url, load_config
 from credentials import load_password
 
 log = logging.getLogger(APP_NAME)
@@ -47,7 +47,48 @@ class LoginResult:
 
 def _portal_host() -> str:
     host = urlparse(load_config().normalized_portal_url()).hostname
-    return host or "211.103.11.101"
+    return host or PORTAL_HOST
+
+
+def _is_school_portal(url: str, text: str = "") -> bool:
+    combined = f"{url}\n{text}".lower()
+    return (
+        PORTAL_HOST in combined
+        or "a79.htm" in combined
+        or "wlanacname=" in combined
+        or "/eportal/" in combined
+        or "dr.comwebloginid" in combined
+    )
+
+
+def discover_portal_url(session: requests.Session | None = None) -> str:
+    """未认证时跟随系统探测跳转，拿到当前的 wlanacname / 客户端 IP；失败则用学校默认地址。"""
+    fallback = default_portal_url()
+    own_session = session is None
+    session = session or _new_session()
+    probes = (
+        "http://www.msftconnecttest.com/redirect",
+        f"http://{PORTAL_HOST}:{PORTAL_PAGE_PORT}/a79.htm",
+    )
+    try:
+        for probe in probes:
+            try:
+                response = _request(session, "GET", probe, timeout=FAST_TIMEOUT, allow_redirects=True)
+            except requests.RequestException as exc:
+                log.info("探测登录页失败 %s: %s", probe, exc)
+                continue
+            final_url = response.url or ""
+            html = response.text or ""
+            if _is_school_portal(final_url, html) and "wlanacname=" in final_url.lower():
+                log.info("发现登录页: %s", final_url)
+                return final_url
+            if _is_school_portal(final_url, html) and "a79.htm" in final_url.lower():
+                log.info("发现登录入口: %s", final_url)
+                return final_url
+        return fallback
+    finally:
+        if own_session:
+            session.close()
 
 
 def _new_session() -> requests.Session:
@@ -209,9 +250,7 @@ def submit_logout(portal_url: str, username: str) -> LoginResult:
 
 def run_logout() -> LoginResult:
     cfg = load_config()
-    portal_url = cfg.normalized_portal_url()
-    if not portal_url:
-        return LoginResult(False, "尚未配置登录页网址")
+    portal_url = discover_portal_url()
     return submit_logout(portal_url, cfg.username.strip())
 
 
@@ -223,20 +262,18 @@ def run_login_loop(
     del force
     cfg = cfg or load_config()
     username = cfg.username.strip()
-    portal_url = cfg.normalized_portal_url()
     password = load_password()
     if not username:
         return LoginResult(False, "尚未配置账号，请先运行设置")
     if not password:
         return LoginResult(False, "未找到已保存的密码，请先运行设置")
-    if not portal_url:
-        return LoginResult(False, "尚未配置登录页网址")
 
     retry_count = max(1, cfg.retry_count)
     indexes = list(attempts) if attempts is not None else list(range(1, retry_count + 1))
     session = _new_session()
     last = LoginResult(False, "尚未尝试登录")
     try:
+        portal_url = discover_portal_url(session)
         for pos, index in enumerate(indexes):
             started = time.perf_counter()
             last = submit_login(portal_url, username, password, session=session)

@@ -1,10 +1,10 @@
 """校园网开机自动登录。
 
 用法:
-  python autoconnect.py           未配置则打开设置，已配置则立即登录
-  python autoconnect.py --setup   打开设置窗口
-  python autoconnect.py --login   静默检测并登录（开机任务使用）
-  python autoconnect.py --uninstall [--purge]  删除开机任务，可选清除凭据
+  AutoConnect.exe / python autoconnect.py   打开设置窗口
+  --setup          打开设置窗口
+  --login          静默检测并登录（开机任务使用）
+  --uninstall [--purge]  删除开机任务，可选清除凭据
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import argparse
 import logging
 import sys
 
-from config import APP_NAME, config_exists, log_path
+from config import APP_NAME, config_exists, is_frozen, log_path
 from notify import notify
 from portal import run_login_loop, run_logout
 
@@ -47,7 +47,7 @@ def _enable_utf8_stdio() -> None:
 def cmd_login(silent_notify: bool) -> int:
     log = logging.getLogger(APP_NAME)
     if not config_exists():
-        message = "尚未配置校园网账号，请先运行 python autoconnect.py --setup"
+        message = "尚未配置校园网账号，请先打开 AutoConnect 填写账号和密码"
         log.error(message)
         if silent_notify:
             notify("校园网自动登录", message)
@@ -89,11 +89,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="校园网开机自动登录",
         epilog=(
-            "首次使用: python autoconnect.py --setup\n"
-            "立即登录: python autoconnect.py --login\n"
-            "强制登录: python autoconnect.py --login --force\n"
-            "先注销再测: python autoconnect.py --logout\n"
-            "卸载任务: python autoconnect.py --uninstall"
+            "打开设置: AutoConnect.exe  或  python autoconnect.py --setup\n"
+            "立即登录: AutoConnect.exe --login\n"
+            "强制登录: AutoConnect.exe --login --force\n"
+            "断开网络: AutoConnect.exe --logout\n"
+            "卸载任务: AutoConnect.exe --uninstall"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -131,7 +131,8 @@ def main() -> int:
             print(result.message)
             return 2
         return cmd_login(silent_notify=True)
-    if not config_exists():
+    # 双击 exe 始终打开设置；源码运行且已配置时仍直接登录
+    if is_frozen() or not config_exists():
         from setup_ui import run_setup_ui
 
         run_setup_ui()

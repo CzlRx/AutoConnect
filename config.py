@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -12,9 +13,23 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 APP_NAME = "AutoConnect"
 log = logging.getLogger(APP_NAME)
 
+SCHOOL_NAME = "常州大学"
+PORTAL_HOST = "211.103.11.101"
+PORTAL_PAGE_PORT = 1028
+DEFAULT_WLAN_AC_NAME = "0011.0519.250.00"
+DEFAULT_SSID = "CCZU-CMCC"
+
 DEFAULT_RETRY_COUNT = 20
 DEFAULT_RETRY_INTERVAL_SEC = 1
 DEFAULT_STARTUP_DELAY_SEC = 0
+
+
+def default_portal_url() -> str:
+    return (
+        f"http://{PORTAL_HOST}:{PORTAL_PAGE_PORT}/a79.htm"
+        f"?wlanacname={DEFAULT_WLAN_AC_NAME}&ssid={DEFAULT_SSID}"
+    )
+
 
 # 这些是你电脑当时的地址，每次拨号都会变，不能写死在配置里
 _CLIENT_QUERY_KEYS = {
@@ -46,6 +61,16 @@ def sanitize_portal_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(kept)))
 
 
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir() -> Path:
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
@@ -72,7 +97,7 @@ class AppConfig:
     startup_delay_sec: int = DEFAULT_STARTUP_DELAY_SEC
 
     def normalized_portal_url(self) -> str:
-        return sanitize_portal_url(self.portal_url)
+        return sanitize_portal_url(self.portal_url) or default_portal_url()
 
 
 def load_config() -> AppConfig:
@@ -95,7 +120,7 @@ def load_config() -> AppConfig:
 
 
 def save_config(cfg: AppConfig) -> None:
-    cfg.portal_url = sanitize_portal_url(cfg.portal_url)
+    cfg.portal_url = sanitize_portal_url(cfg.portal_url) or default_portal_url()
     path = config_path()
     path.write_text(
         json.dumps(asdict(cfg), ensure_ascii=False, indent=2),

@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from config import APP_NAME
+from config import APP_NAME, DEFAULT_WLAN_AC_NAME, PORTAL_HOST
 
 log = logging.getLogger(APP_NAME)
 
@@ -224,7 +224,7 @@ def _outbound_ip(host: str) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.2)
     try:
-        sock.connect((host or "211.103.11.101", 801))
+        sock.connect((host or PORTAL_HOST, 801))
         return sock.getsockname()[0]
     except OSError:
         return ""
@@ -312,9 +312,9 @@ def campus_ipv4s() -> list[str]:
     try:
         from config import load_config
 
-        host = urlparse(load_config().normalized_portal_url()).hostname or "211.103.11.101"
+        host = urlparse(load_config().normalized_portal_url()).hostname or PORTAL_HOST
     except Exception:
-        host = "211.103.11.101"
+        host = PORTAL_HOST
     add(_outbound_ip(host))
     if sys.platform == "win32":
         try:
@@ -380,12 +380,12 @@ def login_drcom_portal(session: requests.Session, url: str, html: str, username:
     cfg_parsed = urlparse(cfg_url)
     cfg_query = parse_qs(cfg_parsed.query)
     query = parse_qs(parsed.query)
-    host = _js_assign(html, "v4serip") or parsed.hostname or cfg_parsed.hostname or ""
+    host = _js_assign(html, "v4serip") or parsed.hostname or cfg_parsed.hostname or PORTAL_HOST
     if not host:
-        return False, "登录页地址无效"
+        return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
     ips = _candidate_ips(url, html)
     if not ips:
-        return False, "无法确定认证用的内网 IP（wlanuserip），请用未登录时的完整跳转链接"
+        return False, "无法获取本机校园网 IP，请确认已连接校园 Wi-Fi 后再试"
     accounts = _account_variants(username)
     scheme = parsed.scheme or cfg_parsed.scheme or "http"
     login_url = f"{scheme}://{host}:801/eportal/"
@@ -408,7 +408,8 @@ def login_drcom_portal(session: requests.Session, url: str, html: str, username:
                 ).replace(":", "").replace("-", ""),
                 "wlan_ac_ip": _qs_first(query, "wlanacip", "acip") or _qs_first(cfg_query, "wlanacip", "acip"),
                 "wlan_ac_name": _qs_first(query, "wlanacname", "sysname")
-                or _qs_first(cfg_query, "wlanacname", "sysname"),
+                or _qs_first(cfg_query, "wlanacname", "sysname")
+                or DEFAULT_WLAN_AC_NAME,
                 "jsVersion": _js_assign(html, "jsVersion") or "3.0",
                 "v": str(int(time.time() * 1000)),
             }
@@ -466,12 +467,16 @@ def logout_drcom_portal(session: requests.Session, url: str, html: str, username
     cfg_parsed = urlparse(cfg_url)
     cfg_query = parse_qs(cfg_parsed.query)
     query = parse_qs(parsed.query)
-    host = _js_assign(html, "v4serip") or parsed.hostname or cfg_parsed.hostname or ""
+    host = _js_assign(html, "v4serip") or parsed.hostname or cfg_parsed.hostname or PORTAL_HOST
     if not host:
-        return False, "登录页地址无效"
+        return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
     scheme = parsed.scheme or cfg_parsed.scheme or "http"
     ips = _candidate_ips(url, html)
-    ac_name = _qs_first(query, "wlanacname", "sysname") or _qs_first(cfg_query, "wlanacname", "sysname")
+    ac_name = (
+        _qs_first(query, "wlanacname", "sysname")
+        or _qs_first(cfg_query, "wlanacname", "sysname")
+        or DEFAULT_WLAN_AC_NAME
+    )
     ac_ip = _qs_first(query, "wlanacip", "acip") or _qs_first(cfg_query, "wlanacip", "acip")
     accounts = _account_variants(username) if username else ["drcom"]
     last_message = "注销失败"
