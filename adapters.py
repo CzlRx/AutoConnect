@@ -10,6 +10,7 @@ import math
 import random
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
@@ -795,6 +796,43 @@ def _drcom_carrier_hint(suffix: str) -> str:
     except Exception:
         return ""
     return "；若账号属于移动/联通/电信，请在设置的「服务类型」里选对运营商"
+
+
+_IF_TYPE_ETHERNET = 6
+_IF_TYPE_LOOPBACK = 24
+_IF_TYPE_IEEE80211 = 71
+_IF_TYPE_TUNNEL = 131
+_IF_OPER_UP = 1
+
+_VIRTUAL_NIC_RE = re.compile(
+    r"wintun|meta|clash|mihomo|\btun\b|tunnel|tap-?win|tap\b|wireguard|sing-?box|"
+    r"vmware|virtualbox|hyper-?v|vethernet|docker|vpn|softether|openvpn|"
+    r"zerotier|tailscale|netch",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class NicIPv4:
+    ip: str
+    friendly_name: str
+    description: str
+    if_type: int
+    virtual: bool
+    physical: bool
+
+
+def _is_fake_ip(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(item) for item in parts]
+    except ValueError:
+        return False
+    return nums[0] == 198 and nums[1] in {18, 19}
+
+
 def _is_campus_ip(ip: str) -> bool:
     parts = ip.split(".")
     if len(parts) != 4:
@@ -805,6 +843,8 @@ def _is_campus_ip(ip: str) -> bool:
         return False
     if any(item < 0 or item > 255 for item in nums):
         return False
+    if _is_fake_ip(ip):
+        return False
     if nums[0] == 10:
         return True
     if nums[0] == 192 and nums[1] == 168:
@@ -812,6 +852,27 @@ def _is_campus_ip(ip: str) -> bool:
     if nums[0] == 172 and 16 <= nums[1] <= 31:
         return True
     return False
+
+
+def _is_host_like(ip: str) -> bool:
+    return ip.endswith(".1") or ip.endswith(".255")
+
+
+def _is_inbox_tunnel(name: str, description: str) -> bool:
+    return bool(re.search(r"teredo|isatap|6to4", f"{name} {description}", re.I))
+
+
+def _is_virtual_nic(name: str, description: str, if_type: int) -> bool:
+    if if_type == _IF_TYPE_LOOPBACK or _is_inbox_tunnel(name, description):
+        return False
+    if if_type == _IF_TYPE_TUNNEL:
+        return True
+    blob = f"{name} {description}"
+    return bool(_VIRTUAL_NIC_RE.search(blob))
+
+
+def _is_physical_nic(if_type: int) -> bool:
+    return if_type in {_IF_TYPE_IEEE80211, _IF_TYPE_ETHERNET}
 
 
 def _outbound_ip(host: str) -> str:
@@ -828,18 +889,30 @@ def _outbound_ip(host: str) -> str:
         sock.close()
 
 
-def _win_unicast_ipv4() -> list[str]:
+def _wchar_at(ptr: int | None) -> str:
+    import ctypes
+
+    if not ptr:
+        return ""
+    try:
+        return ctypes.wstring_at(ptr) or ""
+    except (ValueError, OSError):
+        return ""
+
+
+def _win_nic_ipv4s() -> list[NicIPv4]:
     import ctypes
     from ctypes import wintypes
 
     iphlpapi = ctypes.WinDLL("iphlpapi")
     af_inet = 2
     overflow = 111
+    flags = 0x000E  # skip anycast / multicast / DNS
     size = wintypes.ULONG(15000)
     buf = ctypes.create_string_buffer(size.value)
 
     class SOCKADDR(ctypes.Structure):
-        _fields_ = [("sa_family", wintypes.USHORT), ("sa_data", ctypes.c_char * 14)]
+        _fields_ = [("sa_family", wintypes.USHORT), ("sa_data", ctypes.c_ubyte * 14)]
 
     class SOCKET_ADDRESS(ctypes.Structure):
         _fields_ = [
@@ -864,43 +937,156 @@ def _win_unicast_ipv4() -> list[str]:
         ("Length", wintypes.ULONG),
         ("IfIndex", wintypes.DWORD),
         ("Next", ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
-        ("AdapterName", ctypes.c_char_p),
+        ("AdapterName", ctypes.c_void_p),
         ("FirstUnicastAddress", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+        ("FirstAnycastAddress", ctypes.c_void_p),
+        ("FirstMulticastAddress", ctypes.c_void_p),
+        ("FirstDnsServerAddress", ctypes.c_void_p),
+        ("DnsSuffix", ctypes.c_void_p),
+        ("Description", ctypes.c_void_p),
+        ("FriendlyName", ctypes.c_void_p),
+        ("PhysicalAddress", ctypes.c_ubyte * 8),
+        ("PhysicalAddressLength", wintypes.ULONG),
+        ("Flags", wintypes.ULONG),
+        ("Mtu", wintypes.ULONG),
+        ("IfType", wintypes.ULONG),
+        ("OperStatus", ctypes.c_int),
     ]
 
-    ret = iphlpapi.GetAdaptersAddresses(af_inet, 0, None, buf, ctypes.byref(size))
+    ret = iphlpapi.GetAdaptersAddresses(af_inet, flags, None, buf, ctypes.byref(size))
     if ret == overflow:
         buf = ctypes.create_string_buffer(size.value)
-        ret = iphlpapi.GetAdaptersAddresses(af_inet, 0, None, buf, ctypes.byref(size))
+        ret = iphlpapi.GetAdaptersAddresses(af_inet, flags, None, buf, ctypes.byref(size))
     if ret != 0:
         return []
 
-    ips: list[str] = []
+    nics: list[NicIPv4] = []
     adapter = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))
     while adapter:
-        unicast = adapter.contents.FirstUnicastAddress
+        item = adapter.contents
+        if item.OperStatus != _IF_OPER_UP:
+            adapter = item.Next
+            continue
+        if_type = int(item.IfType)
+        if if_type == _IF_TYPE_LOOPBACK:
+            adapter = item.Next
+            continue
+        friendly = _wchar_at(item.FriendlyName)
+        description = _wchar_at(item.Description)
+        virtual = _is_virtual_nic(friendly, description, if_type)
+        physical = _is_physical_nic(if_type) and not virtual
+        unicast = item.FirstUnicastAddress
+        found_ip = False
         while unicast:
             sockaddr = unicast.contents.Address.lpSockaddr
             if sockaddr and sockaddr.contents.sa_family == af_inet:
-                data = bytes(sockaddr.contents.sa_data)
+                data = sockaddr.contents.sa_data
                 ip = f"{data[2]}.{data[3]}.{data[4]}.{data[5]}"
-                ips.append(ip)
+                nics.append(
+                    NicIPv4(
+                        ip=ip,
+                        friendly_name=friendly,
+                        description=description,
+                        if_type=if_type,
+                        virtual=virtual,
+                        physical=physical,
+                    )
+                )
+                found_ip = True
             unicast = unicast.contents.Next
-        adapter = adapter.contents.Next
-    return ips
+        if not found_ip and virtual:
+            nics.append(
+                NicIPv4(
+                    ip="",
+                    friendly_name=friendly,
+                    description=description,
+                    if_type=if_type,
+                    virtual=True,
+                    physical=False,
+                )
+            )
+        adapter = item.Next
+    return nics
+
+
+def _nic_sort_key(nic: NicIPv4) -> tuple[int, int, str]:
+    if nic.if_type == _IF_TYPE_IEEE80211:
+        kind = 0
+    elif nic.if_type == _IF_TYPE_ETHERNET:
+        kind = 1
+    else:
+        kind = 2
+    return (0 if nic.physical else 1, kind, nic.ip)
+
+
+def list_nic_ipv4s() -> list[NicIPv4]:
+    import sys
+
+    if sys.platform != "win32":
+        return []
+    try:
+        return _win_nic_ipv4s()
+    except Exception:
+        log.warning("读取网卡地址失败", exc_info=True)
+        return []
+
+
+def virtual_nic_names() -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for nic in list_nic_ipv4s():
+        if not nic.virtual:
+            continue
+        label = nic.friendly_name or nic.description or nic.ip or "虚拟网卡"
+        if label in seen:
+            continue
+        seen.add(label)
+        names.append(label)
+    return names
+
+
+def virtual_nic_active() -> bool:
+    return bool(virtual_nic_names())
+
+
+def _virtual_ips() -> set[str]:
+    return {nic.ip for nic in list_nic_ipv4s() if nic.virtual and nic.ip}
+
+
+def _is_virtual_ip(ip: str) -> bool:
+    ip = (ip or "").strip()
+    return bool(ip) and ip in _virtual_ips()
+
+
+def _usable_client_ip(ip: str) -> bool:
+    ip = (ip or "").strip()
+    if not ip or not _is_campus_ip(ip) or _is_host_like(ip) or _is_fake_ip(ip):
+        return False
+    return not _is_virtual_ip(ip)
+
+
+def preferred_source_ip() -> str:
+    ips = campus_ipv4s()
+    return ips[0] if ips else ""
+
+
+def nic_summary() -> str:
+    parts: list[str] = []
+    for nic in list_nic_ipv4s():
+        tag = "虚拟" if nic.virtual else ("物理" if nic.physical else "其他")
+        label = nic.friendly_name or nic.description or "?"
+        addr = nic.ip or "-"
+        parts.append(f"{addr} ({label}/{tag})")
+    return "; ".join(parts) or "无"
 
 
 def campus_ipv4s() -> list[str]:
-    import sys
-
     ips: list[str] = []
     seen: set[str] = set()
 
     def add(ip: str) -> None:
         ip = (ip or "").strip()
-        if not ip or ip in seen or not _is_campus_ip(ip):
-            return
-        if ip.endswith(".1") or ip.endswith(".255"):
+        if not ip or ip in seen or not _usable_client_ip(ip):
             return
         seen.add(ip)
         ips.append(ip)
@@ -911,13 +1097,22 @@ def campus_ipv4s() -> list[str]:
         host = urlparse(load_config().normalized_portal_url()).hostname or PORTAL_HOST
     except Exception:
         host = PORTAL_HOST
-    add(_outbound_ip(host))
-    if sys.platform == "win32":
-        try:
-            for ip in _win_unicast_ipv4():
-                add(ip)
-        except Exception:
-            log.debug("读取网卡地址失败", exc_info=True)
+    outbound = _outbound_ip(host)
+    if outbound and not _usable_client_ip(outbound):
+        log.info("出站 IP %s 不是可用的校园网地址，已忽略", outbound)
+    else:
+        add(outbound)
+    physical: list[NicIPv4] = []
+    other: list[NicIPv4] = []
+    for nic in list_nic_ipv4s():
+        if nic.virtual or not nic.ip or not _usable_client_ip(nic.ip):
+            continue
+        if nic.physical:
+            physical.append(nic)
+        else:
+            other.append(nic)
+    for nic in sorted(physical, key=_nic_sort_key) + sorted(other, key=_nic_sort_key):
+        add(nic.ip)
     return ips
 
 
@@ -973,9 +1168,7 @@ def _candidate_ips(url: str, html: str) -> list[str]:
 
     def add(ip: str) -> None:
         ip = (ip or "").strip()
-        if not ip or not _is_campus_ip(ip) or ip in ordered:
-            return
-        if ip.endswith(".1") or ip.endswith(".255"):
+        if not ip or not _usable_client_ip(ip) or ip in ordered:
             return
         ordered.append(ip)
 

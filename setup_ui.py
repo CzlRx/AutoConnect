@@ -9,6 +9,7 @@ from tkinter import messagebox, ttk
 
 from config import (
     APP_NAME,
+    DEFAULT_STARTUP_DELAY_SEC,
     AppConfig,
     CarrierOption,
     carrier_options,
@@ -204,6 +205,8 @@ class SetupApp(tk.Tk):
         else:
             cfg.carrier = ""
             cfg.account_suffix = ""
+        if cfg.startup_delay_sec <= 0:
+            cfg.startup_delay_sec = DEFAULT_STARTUP_DELAY_SEC
         return cfg, password
 
     def _set_busy(self, busy: bool, text: str | None = None) -> None:

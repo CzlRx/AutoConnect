@@ -74,20 +74,68 @@ class LoginResult:
     adapter: str = ""
 
 
+class BoundHTTPAdapter(HTTPAdapter):
+    def __init__(self, source_ip: str = "", **kwargs) -> None:
+        self.source_ip = (source_ip or "").strip()
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        if self.source_ip:
+            pool_kwargs["source_address"] = (self.source_ip, 0)
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
 def _portal_host() -> str:
     host = urlparse(load_config().normalized_portal_url()).hostname
     return host or PORTAL_HOST
 
 
-def _new_session() -> requests.Session:
+def _tun_bypass_hint() -> str:
+    host = _portal_host()
+    if host == PORTAL_HOST:
+        return f"请把 {host} 加入代理直连/绕过（含 801、1028 端口）"
+    return f"请把 {host} 加入代理直连/绕过"
+
+
+def _looks_like_credential_error(message: str) -> bool:
+    text = message or ""
+    return any(token in text for token in CREDENTIAL_TOKENS)
+
+
+def _with_tun_hint(message: str) -> str:
+    if not adapters.virtual_nic_active() or _looks_like_credential_error(message):
+        return message
+    hint = _tun_bypass_hint()
+    if hint in (message or ""):
+        return message
+    return f"{message}。检测到代理虚拟网卡，{hint}"
+
+
+def _new_session(source_ip: str | None = None) -> requests.Session:
+    if source_ip is None:
+        source_ip = adapters.preferred_source_ip()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.trust_env = False
     retry = Retry(total=0, connect=0, read=0, redirect=2, status=0, other=0)
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+    adapter = BoundHTTPAdapter(source_ip or "", max_retries=retry, pool_maxsize=4)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    if source_ip:
+        log.info("HTTP 绑定本地地址: %s", source_ip)
     return session
+
+
+def _rebind_session(session: requests.Session, source_ip: str) -> requests.Session:
+    current = ""
+    for item in session.adapters.values():
+        if isinstance(item, BoundHTTPAdapter):
+            current = item.source_ip
+            break
+    if (source_ip or "") == (current or ""):
+        return session
+    session.close()
+    return _new_session(source_ip)
 
 
 def _request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
@@ -424,30 +472,50 @@ def run_login_loop(
         return LoginResult(False, "未找到已保存的密码，请先运行设置")
 
     retry_count = max(1, cfg.retry_count)
+    interval = max(1, int(cfg.retry_interval_sec))
     indexes = list(attempts) if attempts is not None else list(range(1, retry_count + 1))
+    log.info(
+        "开始登录 重试=%s 间隔=%ss 网卡=%s 虚拟网卡=%s",
+        retry_count,
+        interval,
+        adapters.nic_summary(),
+        ",".join(adapters.virtual_nic_names()) or "无",
+    )
     # 开机时网卡/DHCP 还没就绪，先等网关能连通，避免把重试次数白烧掉
     wait_for_portal(cfg)
-    session = _new_session()
+    ips = adapters.campus_ipv4s()
+    if ips:
+        log.info("校园网 IP 已就绪: %s", ", ".join(ips))
+    else:
+        log.info("尚未取得可用的校园网 IP，将继续尝试认证")
+    session = _new_session(ips[0] if ips else "")
     last = LoginResult(False, "尚未尝试登录")
     try:
         portal_url = cfg.normalized_portal_url()
+        current_ips = adapters.campus_ipv4s()
+        session = _rebind_session(session, current_ips[0] if current_ips else "")
         # 先问网关在不在线：已经在线就别再登录（重复登录会把会话重置成"待放行"）
         state = probe_gateway_online(cfg, session)
         if state is True:
             if wait_online(session=session, cfg=cfg):
                 return LoginResult(True, "已经在线（已确认可以上网）", "drcom")
             log.warning("网关显示在线，但外网仍被劫持")
-            return LoginResult(False, ALREADY_ONLINE_NO_NET_MESSAGE, "drcom")
+            return LoginResult(False, _with_tun_hint(ALREADY_ONLINE_NO_NET_MESSAGE), "drcom")
         for pos, index in enumerate(indexes):
+            current_ips = adapters.campus_ipv4s()
+            source_ip = current_ips[0] if current_ips else ""
+            session = _rebind_session(session, source_ip)
             started = time.perf_counter()
             last = submit_login(portal_url, username, password, session=session)
             log.info(
-                "第 %s/%s 次登录: ok=%s adapter=%s msg=%s 耗时 %.0f ms",
+                "第 %s/%s 次登录: ok=%s adapter=%s msg=%s ips=%s 虚拟网卡=%s 耗时 %.0f ms",
                 index,
-                retry_count,
+                len(indexes),
                 last.ok,
                 last.adapter,
                 last.message,
+                ",".join(current_ips) or "(无)",
+                ",".join(adapters.virtual_nic_names()) or "无",
                 (time.perf_counter() - started) * 1000,
             )
             if last.ok:
@@ -455,12 +523,12 @@ def run_login_loop(
                 if wait_online(session=session, cfg=cfg):
                     return LoginResult(True, f"{last.message}（已确认可以上网）", last.adapter)
                 log.warning("网关已受理认证，但外网仍未放行")
-                return LoginResult(False, AUTH_OK_NO_NET_MESSAGE, last.adapter)
+                return LoginResult(False, _with_tun_hint(AUTH_OK_NO_NET_MESSAGE), last.adapter)
             if any(token in last.message for token in CREDENTIAL_TOKENS):
                 log.info("判定为账号密码问题，停止重试: %s", last.message)
                 return last
             if pos < len(indexes) - 1:
-                time.sleep(0.15)
+                time.sleep(interval)
     finally:
         session.close()
-    return last
+    return LoginResult(False, _with_tun_hint(last.message), last.adapter)
