@@ -4,6 +4,7 @@
   AutoConnect.exe / python autoconnect.py   打开设置窗口
   --setup          打开设置窗口
   --login          静默检测并登录（开机任务使用）
+  --dump           导出当前学校的登录页 HTML（适配新门户用）
   --uninstall [--purge]  删除开机任务，可选清除凭据
 """
 
@@ -93,6 +94,7 @@ def main() -> int:
             "立即登录: AutoConnect.exe --login\n"
             "强制登录: AutoConnect.exe --login --force\n"
             "断开网络: AutoConnect.exe --logout\n"
+            "导出登录页: AutoConnect.exe --dump\n"
             "卸载任务: AutoConnect.exe --uninstall"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -101,6 +103,7 @@ def main() -> int:
     parser.add_argument("--login", action="store_true", help="静默检测并登录")
     parser.add_argument("--force", action="store_true", help="即使已在线也提交登录（方便测试）")
     parser.add_argument("--logout", action="store_true", help="注销校园网，方便接着测试自动登录")
+    parser.add_argument("--dump", action="store_true", help="导出当前学校的登录页 HTML，便于适配新门户")
     parser.add_argument("--uninstall", action="store_true", help="删除开机自动登录任务")
     parser.add_argument("--purge", action="store_true", help="卸载时同时清除账号密码")
     args = parser.parse_args()
@@ -117,6 +120,18 @@ def main() -> int:
         result = run_logout()
         print(result.message)
         return 0 if result.ok else 2
+    if args.dump:
+        from portal import dump_portal_page
+
+        try:
+            path, final_url = dump_portal_page()
+        except Exception as exc:
+            logging.getLogger(APP_NAME).error("导出登录页失败: %s", exc)
+            print(f"导出失败：{exc}")
+            return 2
+        print(f"登录页地址：{final_url or '(未取到)'}")
+        print(f"已保存到：{path}")
+        return 0
     if args.login or args.force:
         if args.force:
             from config import load_config

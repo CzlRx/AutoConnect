@@ -7,15 +7,16 @@ import hmac
 import json
 import logging
 import math
+import random
 import re
 import time
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import APP_NAME, DEFAULT_WLAN_AC_NAME, PORTAL_HOST, redact_secrets
+from config import APP_NAME, DEFAULT_WLAN_AC_NAME, PORTAL_HOST, data_dir, redact_secrets
 
 log = logging.getLogger(APP_NAME)
 
@@ -109,7 +110,11 @@ def login_generic(session: requests.Session, url: str, html: str, username: str,
         forms = soup.find_all("form")
         form = forms[0] if forms else None
     if form is None:
-        return False, "页面中没有找到登录表单，可能是需要专用适配的门户"
+        if _contains_any(html, LOGIN_SUCCESS_TOKENS):
+            # 网关在已认证时通常只显示“已在线 / 注销”，不再给登录表单
+            log.info("页面没有登录表单，但出现已登录特征，判定为已经在线")
+            return True, "已经在线"
+        return False, "页面中没有找到登录表单，可能是需要专用适配的门户（可运行 --dump 导出页面后反馈）"
 
     action = form.get("action") or url
     method = (form.get("method") or "post").lower()
@@ -153,31 +158,316 @@ def login_generic(session: requests.Session, url: str, html: str, username: str,
         response = session.get(target, params=data, timeout=12)
     else:
         response = session.post(target, data=data, timeout=12)
-    return _guess_login_result(response)
+    _fix_encoding(response)
+    ok, message = _guess_login_result(response)
+    if not ok:
+        return False, message
+    return _verify_generic_login(session, url, response, message)
+
+
+# 页面上出现这些字样，说明已经登录（或登录后跳到了带注销入口的页面）
+LOGIN_SUCCESS_TOKENS = ("登录成功", "成功登录", "注销", "退出", "logout", "logoff", "welcome")
+LOGOUT_HINTS = ("logout", "logoff", "quit", "注销", "退出", "下线")
+
+
+def _fix_encoding(response: requests.Response) -> None:
+    charset = _response_charset(response)
+    if charset:
+        response.encoding = charset
+    elif not response.encoding or response.encoding.lower() in {"iso-8859-1", "ascii"}:
+        response.encoding = response.apparent_encoding or "utf-8"
+
+
+def _contains_any(text: str, tokens) -> bool:
+    lowered = (text or "").lower()
+    return any(token.lower() in lowered for token in tokens)
+
+
+def _has_password_field(html: str) -> bool:
+    soup = BeautifulSoup(html or "", "html.parser")
+    for inp in soup.find_all("input"):
+        if (inp.get("type") or "").lower() == "password":
+            return True
+        if (inp.get("name") or "").strip().lower() in PASSWORD_KEYS:
+            return True
+    return False
+
+
+def _verify_generic_login(
+    session: requests.Session,
+    portal_url: str,
+    response: requests.Response,
+    fallback_message: str,
+) -> tuple[bool, str]:
+    """提交后回访门户页：仍然拿得到登录表单就视为失败。"""
+    if _contains_any(response.text or "", LOGIN_SUCCESS_TOKENS):
+        return True, "登录成功"
+    try:
+        check = session.get(portal_url, timeout=6, headers={"Referer": portal_url})
+    except requests.RequestException as exc:
+        detail = redact_secrets(str(exc))
+        log.info("回访门户页失败，按已提交处理: %s", detail)
+        return True, f"已提交登录（未能回访验证：{detail}）"
+    _fix_encoding(check)
+    check_html = check.text or ""
+    if _contains_any(check_html, LOGIN_SUCCESS_TOKENS):
+        return True, "登录成功"
+    if _has_password_field(check_html):
+        log.info("回访门户页仍存在密码输入框，判定登录失败")
+        return False, "提交后仍然显示登录表单，请检查账号密码是否正确"
+    if not check_html.strip():
+        return True, fallback_message or "已提交登录"
+    return True, "登录成功"
+
+
+def logout_generic(session: requests.Session, url: str, html: str) -> tuple[bool, str]:
+    """在门户页面上找注销入口并访问；找不到就如实说明。"""
+    if not (html or "").strip():
+        return False, "打不开门户页面，请确认已连上校园网"
+    soup = BeautifulSoup(html, "html.parser")
+    target = ""
+    for link in soup.find_all("a"):
+        href = (link.get("href") or "").strip()
+        if not href or href.lower().startswith(("javascript:", "#", "mailto:")):
+            continue
+        if _contains_any(f"{href} {link.get_text() or ''}", LOGOUT_HINTS):
+            target = urljoin(url, href)
+            break
+    if not target:
+        for form in soup.find_all("form"):
+            action = (form.get("action") or "").strip()
+            if action and _contains_any(f"{action} {form.get_text() or ''}", LOGOUT_HINTS):
+                target = urljoin(url, action)
+                break
+    if not target:
+        return False, "门户页面上没有找到注销入口，无法自动断开"
+    log.info("通用注销: %s", target)
+    try:
+        response = session.get(target, timeout=10, headers={"Referer": url})
+    except requests.RequestException as exc:
+        return False, f"注销请求失败: {exc}"
+    _fix_encoding(response)
+    return True, "已发送注销请求，请再试外网是否已断开"
+
+
+def login_drcom_api(
+    session: requests.Session,
+    url: str,
+    html: str,
+    username: str,
+    password: str,
+) -> tuple[bool, str]:
+    """城市热点「全业务接口」：GET {host}/drcom/login（官方页面 default_login 用的就是它）。
+
+    官方实现（a40.js）：
+      account = 账号 + 运营商后缀（ISP_select 的值）
+      data = {DDDDD, upass, 0MKKey:123456, R1,R2,R3,R6,para,v6ip, terminal_type, lang}
+      result == 1 / 'ok' 表示成功，ret_code == 2 表示已经在线
+    """
+    params = _drcom_web_params(html) if html else {}
+    parsed = urlparse(url)
+    host = params.get("serip") or parsed.hostname or PORTAL_HOST
+    if not host:
+        return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
+    scheme = parsed.scheme or "http"
+    target = f"{scheme}://{host}/drcom/login"
+    base = username.strip()
+    suffix = _carrier_suffix(html)
+    account = base + suffix if suffix and not base.lower().endswith(suffix.lower()) else base
+    data = {
+        "callback": f"dr{int(time.time() * 1000) % 100000}",
+        "DDDDD": account,
+        "upass": password,
+        "0MKKey": "123456",
+        "R1": "0",
+        "R2": "",
+        "R3": "0",
+        "R6": "0",
+        "para": "00",
+        "v6ip": "",
+        "terminal_type": "1",
+        "lang": "zh",
+        "v": str(int(time.time() * 1000)),
+    }
+    log.info(
+        "城市热点全业务接口登录: %s?%s 运营商后缀=%s",
+        target,
+        redact_secrets(urlencode(data)),
+        suffix or "(未选)",
+    )
+    try:
+        response = session.get(target, params=data, timeout=10, headers={"Referer": url})
+    except requests.RequestException as exc:
+        return False, f"认证接口暂不可达: {redact_secrets(str(exc))}"
+    text = _decode_body(response, params.get("charset", ""))
+    try:
+        payload = _jsonp_payload(text)
+    except Exception:
+        log.info("全业务接口返回无法解析(HTTP %s): %s", response.status_code, " ".join(text.split())[:200])
+        return False, f"全业务接口返回无法解析（HTTP {response.status_code}）"
+    if not isinstance(payload, dict):
+        return False, "全业务接口返回格式异常"
+    result = payload.get("result")
+    message = str(payload.get("msg") or payload.get("message") or "")
+    ret_code = payload.get("ret_code")
+    log.info("全业务接口返回: result=%s ret_code=%s msg=%s", result, ret_code, message[:80])
+    if str(result) in {"1", "ok"} or result is True:
+        return True, message or "校园网登录成功"
+    if str(ret_code) == "2" or "already" in message.lower() or "已经在线" in message:
+        return True, message or "已经在线"
+    if message:
+        if _looks_like_credential_error(message):
+            return False, message + _drcom_carrier_hint(suffix)
+        return False, message
+    return False, f"登录失败（result={result}）"
+
+
+def _portal_api_first() -> bool:
+    """该校是否优先走 801 的现代门户接口（常州工学院是，常州大学走老接口）。"""
+    try:
+        from config import load_config
+
+        return bool(load_config().profile().portal_api_first)
+    except Exception:
+        return False
+
+
+def login_drcom_portal_api(
+    session: requests.Session,
+    url: str,
+    html: str,
+    username: str,
+    password: str,
+) -> tuple[bool, str]:
+    """现代门户接口：GET http://<网关>:801/eportal/portal/login。
+
+    参数和顺序照抄浏览器实际发出的登录请求（2026-10-06 抓包）：
+      callback, login_method=1, user_account, user_password, wlan_user_ip,
+      wlan_user_ipv6, wlan_user_mac, wlan_ac_ip, wlan_ac_name, jsVersion=4.2.1,
+      terminal_type=1, lang=zh-cn, v, lang=zh
+    成功 = JSONP 里 result 为 1/'ok'；ret_code=2 表示已经在线。
+    """
+    params = _drcom_web_params(html) if html else {}
+    parsed = urlparse(url)
+    host = params.get("serip") or parsed.hostname or PORTAL_HOST
+    if not host:
+        return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
+    scheme = parsed.scheme or "http"
+    hostname = host.split(":")[0]
+    target = f"{scheme}://{hostname}:801/eportal/portal/login"
+    base = username.strip()
+    suffix = _carrier_suffix(html)
+    account = base + suffix if suffix and not base.lower().endswith(suffix.lower()) else base
+    items = [
+        ("callback", f"dr{int(time.time() * 1000) % 10000}"),
+        ("login_method", "1"),
+        ("user_account", account),
+        ("user_password", password),
+        ("wlan_user_ip", params.get("ip") or ""),
+        ("wlan_user_ipv6", ""),
+        ("wlan_user_mac", "000000000000"),
+        ("wlan_ac_ip", ""),
+        ("wlan_ac_name", ""),
+        ("jsVersion", "4.2.1"),
+        ("terminal_type", "1"),
+        ("lang", "zh-cn"),
+        ("v", str(random.randint(500, 10500))),
+        ("lang", "zh"),
+    ]
+    log.info(
+        "城市热点门户接口登录: %s?%s",
+        target,
+        redact_secrets(urlencode(items)),
+    )
+    try:
+        response = session.get(target, params=items, timeout=10, headers={"Referer": url})
+    except requests.RequestException as exc:
+        return False, f"认证接口暂不可达: {redact_secrets(str(exc))}"
+    text = _decode_body(response, params.get("charset", ""))
+    try:
+        payload = _jsonp_payload(text)
+    except Exception:
+        log.info("门户接口返回无法解析(HTTP %s): %s", response.status_code, " ".join(text.split())[:200])
+        return False, f"门户接口返回无法解析（HTTP {response.status_code}）"
+    if not isinstance(payload, dict):
+        return False, "门户接口返回格式异常"
+    result = payload.get("result")
+    message = str(payload.get("msg") or payload.get("message") or "")
+    ret_code = payload.get("ret_code")
+    log.info("门户接口返回: result=%s ret_code=%s msg=%s", result, ret_code, message[:80])
+    if str(result) in {"1", "ok"} or result is True:
+        return True, message or "校园网登录成功"
+    if str(ret_code) == "2" or "already" in message.lower() or "已经在线" in message:
+        return True, message or "已经在线"
+    if message:
+        if _looks_like_credential_error(message):
+            return False, message + _drcom_carrier_hint(suffix)
+        return False, message
+    return False, f"登录失败（result={result}）"
 
 
 def login_drcom(session: requests.Session, url: str, html: str, username: str, password: str) -> tuple[bool, str]:
+    api_first = _portal_api_first()
+    # 1) 现代门户接口：801 端口 /eportal/portal/login（常州工学院浏览器实际用的就是这个）
+    if api_first:
+        ok, message = login_drcom_portal_api(session, url, html, username, password)
+        if ok or _looks_like_credential_error(message):
+            return ok, message
+        log.info("门户接口未成功，改试 AC 本地接口: %s", message)
+
+    # 2) AC 本地接口：/drcom/login（官方 a40.js 里 login_method=0 那一路）
+    ok, message = login_drcom_api(session, url, html, username, password)
+    if ok or _looks_like_credential_error(message):
+        return ok, message
+    log.info("AC 本地接口未成功，改试网页表单接口: %s", message)
+
+    # 2b) 该校不优先走门户接口时，在这一步补试一次
+    if not api_first:
+        ok, message = login_drcom_portal_api(session, url, html, username, password)
+        if ok or _looks_like_credential_error(message):
+            return ok, message
+        log.info("门户接口未成功，改试网页表单接口: %s", message)
+
+    # 3) 页面自己声明的 WebLoginID（ACSetting）流程
+    if is_drcom_web_login_page(html):
+        ok, message = login_drcom_web_login(session, url, html, username, password)
+        if ok or _looks_like_credential_error(message):
+            return ok, message
+        log.info("WebLoginID 登录未成功，改用 eportal 接口: %s", message)
+
+    # 4) 老式 eportal 接口（常州大学走的这条）
     if _is_drcom_portal(url, html) or not BeautifulSoup(html or "", "html.parser").find("form"):
-        return login_drcom_portal(session, url, html, username, password)
-    soup = BeautifulSoup(html or "", "html.parser")
-    form = soup.find("form")
-    target = urljoin(url, form.get("action") if form else url)
-    data: dict[str, str] = {}
-    if form:
-        for inp in form.find_all("input"):
-            name = inp.get("name")
-            if name:
-                data[name] = inp.get("value") or ""
-    data["DDDDD"] = username
-    data["upass"] = password
-    data.setdefault("0MKKey", "Login")
-    response = session.post(target, data=data, timeout=12)
-    text = response.text or ""
-    if any(token in text for token in ("successfully logged in", "登录成功", "您已经成功登录", "logout")):
-        return True, "Dr.com 登录成功"
-    if any(token in text for token in ("密码错误", "账号错误", "msga", "Info:")):
-        return False, "Dr.com 登录失败，请检查账号密码"
-    return _guess_login_result(response)
+        ok, message = login_drcom_portal(session, url, html, username, password)
+    else:
+        soup = BeautifulSoup(html or "", "html.parser")
+        form = soup.find("form")
+        target = urljoin(url, form.get("action") if form else url)
+        data: dict[str, str] = {}
+        if form:
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                if name:
+                    data[name] = inp.get("value") or ""
+        data["DDDDD"] = username
+        data["upass"] = password
+        data.setdefault("0MKKey", "Login")
+        response = session.post(target, data=data, timeout=12)
+        text = response.text or ""
+        if any(token in text for token in ("successfully logged in", "登录成功", "您已经成功登录", "logout")):
+            return True, "Dr.com 登录成功"
+        if any(token in text for token in ("密码错误", "账号错误", "msga", "Info:")):
+            return False, "Dr.com 登录失败，请检查账号密码"
+        ok, message = _guess_login_result(response)
+    if ok or _looks_like_credential_error(message):
+        return ok, message
+
+    # 4) 都没给明确结果，回访确认是否已经在线
+    status = drcom_status_after_login(session, url, html)
+    if status is True:
+        return True, "已经在线"
+    if status is False:
+        message = f"{message}；回访确认仍未在线"
+    return False, message
 
 
 def _qs_first(query: dict[str, list[str]], *keys: str) -> str:
@@ -187,6 +477,242 @@ def _qs_first(query: dict[str, list[str]], *keys: str) -> str:
         if values and values[0]:
             return values[0]
     return ""
+
+
+_HEADER_CHARSET_RE = re.compile(r"charset\s*=\s*([A-Za-z0-9_\-]+)", re.I)
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.I)
+
+
+def _response_charset(response: requests.Response, fallback: str = "") -> str:
+    """响应自己声明的编码优先（Content-Type 头 → 页面 meta），再退回调用方给的。"""
+    match = _HEADER_CHARSET_RE.search(response.headers.get("Content-Type") or "")
+    if match:
+        return match.group(1)
+    match = _META_CHARSET_RE.search(response.content or b"")
+    if match:
+        return match.group(1).decode("ascii", "ignore")
+    return fallback
+
+
+def _decode_body(response: requests.Response, charset: str = "") -> str:
+    """解码响应体：先信响应自己的编码，再用门户页声明的编码兜底。"""
+    raw = response.content or b""
+    for encoding in (_response_charset(response, charset), "utf-8", "gb18030", response.apparent_encoding):
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _drcom_web_params(html: str) -> dict[str, str]:
+    """读取 Dr.COM WebLoginID 页面里自己声明的登录参数。"""
+    return {
+        "serip": _js_assign(html, "v4serip"),
+        "ip": _js_assign(html, "ss5") or _js_assign(html, "v46ip"),
+        "ac_name": _js_assign(html, "AC"),
+        "port": _js_assign(html, "authloginport") or "801",
+        "path": _js_assign(html, "authloginpath") or "/eportal/?c=ACSetting&a=Login",
+        "param": _js_assign(html, "authloginparam"),
+        "user_field": _js_assign(html, "authuserfield") or "DDDDD",
+        "pass_field": _js_assign(html, "authpassfield") or "upass",
+        "success": _js_assign(html, "authsuccess") or "Dr.COMWebLoginID_3.htm",
+        "fail": _js_assign(html, "authfail") or "Dr.COMWebLoginID_2.htm",
+        "charset": _js_assign(html, "charset"),
+    }
+
+
+def is_drcom_web_login_page(html: str) -> bool:
+    """是不是城市热点 WebLoginID 页面（登录参数写在页面 JS 里）。"""
+    html = html or ""
+    return bool(_js_assign(html, "authloginpath")) or "dr.comwebloginid" in html.lower()
+
+
+def _drcom_login_page(html: str) -> bool:
+    """这一页还是登录页吗（说明还没认证）。"""
+    lowered = (html or "").lower()
+    if "dr.comwebloginid_0.htm" in lowered:
+        return True
+    if "dr.comwebloginid_1.htm" in lowered or "dr.comwebloginid_3.htm" in lowered:
+        return False  # 注销页 / 登录成功页，都说明已经认证
+    if re.search(r"\buid\s*=", lowered) or re.search(r"\boltime\s*=", lowered):
+        return False  # 注销页会带在线信息
+    return "authloginpath" in lowered
+
+
+def _looks_like_credential_error(message: str) -> bool:
+    return any(token in (message or "") for token in ("密码", "口令", "账号", "用户不存在"))
+
+
+# 城市热点 WebLoginID 表单里的固定隐藏字段（官方客户端就是发这一组）
+_DRCOM_FORM_DEFAULTS = {
+    "R1": "0",
+    "R2": "0",
+    "R3": "0",
+    "R6": "0",
+    "para": "00",
+    "0MKKey": "123456",
+    "buttonClicked": "",
+    "redirect_url": "",
+    "err_flag": "",
+    "username": "",
+    "password": "",
+    "user": "",
+    "cmd": "",
+    "Login": "",
+}
+
+_DEBUG_SAVED: set[str] = set()
+
+
+def _save_debug_response(tag: str, response: requests.Response, text: str) -> str:
+    """把判定不了的响应存到本地便于排查（每次运行每个 tag 只存一份）。"""
+    if tag in _DEBUG_SAVED:
+        return ""
+    _DEBUG_SAVED.add(tag)
+    try:
+        folder = data_dir() / "debug"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = folder / f"{tag}-{stamp}.html"
+        path.write_text(
+            f"<!-- url: {response.url}\nstatus: {response.status_code}\n"
+            f"charset: {_response_charset(response) or '(未声明)'}\n-->\n{text or ''}",
+            encoding="utf-8",
+            errors="replace",
+        )
+        (folder / f"{tag}-{stamp}.bin").write_bytes(response.content or b"")
+        log.warning("已保存无法判定的响应: %s", path)
+        return str(path)
+    except OSError as exc:
+        log.warning("保存响应失败: %s", exc)
+        return ""
+
+
+def _with_port(host: str, port: str) -> str:
+    """拼端口；host 已经带端口时不再重复拼。"""
+    host = (host or "").strip()
+    if not host or ":" in host:
+        return host
+    return f"{host}:{port}" if port else host
+
+
+def login_drcom_web_login(
+    session: requests.Session,
+    url: str,
+    html: str,
+    username: str,
+    password: str,
+) -> tuple[bool, str]:
+    """城市热点 WebLoginID / ACSetting 登录：完全按页面声明的字段和接口来。"""
+    params = _drcom_web_params(html)
+    parsed = urlparse(url)
+    host = params["serip"] or parsed.hostname or PORTAL_HOST
+    if not host:
+        return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
+    scheme = parsed.scheme or "http"
+    target = f"{scheme}://{_with_port(host, params['port'])}{params['path']}"
+    query = [params["param"]] if params["param"] else []
+    if params["ip"]:
+        query.append(f"wlanuserip={params['ip']}")
+    if params["ac_name"]:
+        query.append(f"wlanacname={params['ac_name']}")
+    if query:
+        target += f"{'&' if '?' in target else '?'}{'&'.join(query)}"
+
+    base = username.strip()
+    suffix = _carrier_suffix(html)
+    account = base + suffix if suffix and not base.lower().endswith(suffix.lower()) else base
+    data = {params["user_field"]: account, params["pass_field"]: password}
+    data.update(_DRCOM_FORM_DEFAULTS)
+    log.info(
+        "城市热点 WebLoginID 登录: %s 账号字段=%s 运营商=%s",
+        target,
+        params["user_field"],
+        suffix or "(未选)",
+    )
+    try:
+        response = session.post(
+            target,
+            data=data,
+            timeout=10,
+            headers={
+                "Referer": url,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+    except requests.RequestException as exc:
+        return False, f"认证接口暂不可达: {redact_secrets(str(exc))}"
+    text = _decode_body(response, params["charset"])
+    final_url = response.url or target
+    snippet = " ".join(text.split())[:200]
+    log.info(
+        "WebLoginID 返回: HTTP %s charset=%s url=%s 片段=%s",
+        response.status_code,
+        _response_charset(response, params["charset"]),
+        final_url,
+        snippet,
+    )
+    success = params["success"].lower()
+    fail = params["fail"].lower()
+    if success and (success in final_url.lower() or success in text.lower()):
+        return True, "校园网登录成功"
+    if any(token in text for token in ("登录成功", "已经在线", "已经成功登录", "已在线")):
+        return True, "校园网登录成功"
+    if fail and (fail in final_url.lower() or fail in text.lower()):
+        return False, "账号或密码错误，请检查后重试" + _drcom_carrier_hint(suffix)
+    if any(token in text for token in ("密码错误", "口令错误", "账号错误", "用户不存在")):
+        return False, "账号或密码错误，请检查后重试" + _drcom_carrier_hint(suffix)
+    if response.status_code >= 400:
+        return False, f"登录请求失败 HTTP {response.status_code}"
+    # 没有明确标志时不能当成功，交给调用方继续用别的接口 / 回访复核
+    dump = _save_debug_response("drcom-weblogin", response, text)
+    message = f"认证接口返回无法判定的页面（HTTP {response.status_code}）"
+    if dump:
+        message += f"，原始响应已保存到 {dump}"
+    log.info("WebLoginID 结果无法判定: %s", snippet)
+    return False, message
+
+
+def drcom_status_after_login(session: requests.Session, url: str, html: str) -> bool | None:
+    """回访门户判断是否已上线：True 已在线 / False 仍未在线 / None 无法判断。"""
+    params = _drcom_web_params(html) if html else {}
+    parsed = urlparse(url)
+    host = params.get("serip") or parsed.hostname
+    scheme = parsed.scheme or "http"
+    if host:
+        status_url = f"{scheme}://{host}/drcom/chkstatus"
+        try:
+            response = session.get(
+                status_url,
+                params={"callback": "dr1002", "v": str(int(time.time() * 1000))},
+                timeout=6,
+                headers={"Referer": url},
+            )
+            payload = _jsonp_payload(_decode_body(response, params.get("charset", "")))
+            if isinstance(payload, dict) and "result" in payload:
+                online = str(payload.get("result")) == "1"
+                log.info("状态查询 /drcom/chkstatus: result=%s", payload.get("result"))
+                return online
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            log.info("状态查询失败，改用回访页面判断: %s", exc)
+    try:
+        response = session.get(url, timeout=6, headers={"Referer": url})
+    except requests.RequestException as exc:
+        log.info("回访门户页失败: %s", redact_secrets(str(exc)))
+        return None
+    text = _decode_body(response, params.get("charset", ""))
+    if not text.strip():
+        return None
+    if _contains_any(text, ("登录成功", "已经在线", "已在线", "logout", "注销", "退出")):
+        log.info("回访门户页显示已登录")
+        return True
+    if _drcom_login_page(text):
+        log.info("回访门户页仍是登录页")
+        return False
+    return True
 
 
 def _js_assign(html: str, name: str) -> str:
@@ -199,6 +725,76 @@ def _js_assign(html: str, name: str) -> str:
     return ""
 
 
+def _js_single_quoted(html: str, name: str) -> str:
+    """取单引号包起来的变量（值里可能含双引号，比如 carrier 的 JSON）。"""
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*'([^']*)'", html or "")
+    return match.group(1).strip() if match else ""
+
+
+def _drcom_carriers(html: str) -> list[tuple[str, str, str]]:
+    """读页面 carrier 变量里的运营商选项：[(id, 名称, 账号后缀), ...]。"""
+    raw = _js_single_quoted(html, "carrier")
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    yys = payload.get("yys") if isinstance(payload, dict) else None
+    data = (yys or {}).get("data") or []
+    options: list[tuple[str, str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        options.append(
+            (
+                str(item.get("id") or ""),
+                str(item.get("name") or ""),
+                str(item.get("suffix") or ""),
+            )
+        )
+    return options
+
+
+def _isp_select_options(html: str) -> list[tuple[str, str, str]]:
+    """读页面里 <select name="ISP_select"> 的运营商选项：[(id, 名称, 后缀), ...]。
+
+    新版门户的登录页模板（pc.js）用这个下拉框；老页面里的 carrier 变量是过时列表，
+    不能当准（例如老列表没有移动、且电信联通后缀与新版不同）。
+    """
+    if not html:
+        return []
+    block = re.search(
+        r"""<select[^>]*name=["']?ISP_select["']?[^>]*>(.*?)</select>""",
+        html,
+        re.I | re.S,
+    )
+    if not block:
+        return []
+    options: list[tuple[str, str, str]] = []
+    for index, item in enumerate(re.finditer(r"<option[^>]*>(.*?)</option>", block.group(1), re.I | re.S)):
+        raw = item.group(0)
+        value_match = re.search(r"""value=["']?([^"'>\s]*)""", raw, re.I)
+        value = (value_match.group(1) if value_match else "").strip()
+        label = re.sub(r"<[^>]+>", "", item.group(1)).strip()
+        if value == "-1" or (not label and not value):
+            continue
+        options.append((str(index + 1), label or value, value))
+    return options
+
+
+def _drcom_carrier_hint(suffix: str) -> str:
+    """选了运营商却仍然账号错误时，提醒可能是运营商没选对。"""
+    if suffix:
+        return ""
+    try:
+        from config import carrier_options, load_config
+
+        if not carrier_options(load_config().resolved_school()):
+            return ""
+    except Exception:
+        return ""
+    return "；若账号属于移动/联通/电信，请在设置的「服务类型」里选对运营商"
 def _is_campus_ip(ip: str) -> bool:
     parts = ip.split(".")
     if len(parts) != 4:
@@ -334,6 +930,29 @@ def _account_suffix() -> str:
         return ""
 
 
+def _selected_carrier_name() -> str:
+    """设置窗口里选的运营商名称（服务类型）。"""
+    try:
+        from config import load_config
+
+        return (load_config().carrier or "").strip()
+    except Exception:
+        return ""
+
+
+def _carrier_suffix(html: str) -> str:
+    """账号后缀：门户页声明的运营商列表优先（按名称匹配），否则用本机保存的后缀。"""
+    saved = _account_suffix()
+    name = _selected_carrier_name()
+    if not name:
+        return saved
+    for _cid, cname, csuffix in _drcom_carriers(html):
+        if cname == name:
+            return csuffix
+    log.info("门户页没声明运营商「%s」，改用保存的后缀 %s", name, saved or "(无)")
+    return saved
+
+
 def _account_variants(username: str) -> list[str]:
     base = username.strip()
     suffix = _account_suffix()
@@ -367,6 +986,18 @@ def _candidate_ips(url: str, html: str) -> list[str]:
     for ip in campus_ipv4s():
         add(ip)
     return ordered
+
+
+def _drcom_ac_name(query: dict[str, list[str]], cfg_query: dict[str, list[str]], html: str, host: str) -> str:
+    """AC 名只在页面或链接里声明过时才用；常州大学的默认值不能带到别的学校。"""
+    name = (
+        _qs_first(query, "wlanacname", "sysname")
+        or _qs_first(cfg_query, "wlanacname", "sysname")
+        or _js_assign(html, "AC")
+    )
+    if name:
+        return name
+    return DEFAULT_WLAN_AC_NAME if (host or "").strip() == PORTAL_HOST else ""
 
 
 def login_drcom_portal(session: requests.Session, url: str, html: str, username: str, password: str) -> tuple[bool, str]:
@@ -407,9 +1038,7 @@ def login_drcom_portal(session: requests.Session, url: str, html: str, username:
                     or "000000000000"
                 ).replace(":", "").replace("-", ""),
                 "wlan_ac_ip": _qs_first(query, "wlanacip", "acip") or _qs_first(cfg_query, "wlanacip", "acip"),
-                "wlan_ac_name": _qs_first(query, "wlanacname", "sysname")
-                or _qs_first(cfg_query, "wlanacname", "sysname")
-                or DEFAULT_WLAN_AC_NAME,
+                "wlan_ac_name": _drcom_ac_name(query, cfg_query, html, host),
                 "jsVersion": _js_assign(html, "jsVersion") or "3.0",
                 "v": str(int(time.time() * 1000)),
             }
@@ -472,11 +1101,7 @@ def logout_drcom_portal(session: requests.Session, url: str, html: str, username
         return False, "登录页地址无效，请确认已连接校园 Wi-Fi"
     scheme = parsed.scheme or cfg_parsed.scheme or "http"
     ips = _candidate_ips(url, html)
-    ac_name = (
-        _qs_first(query, "wlanacname", "sysname")
-        or _qs_first(cfg_query, "wlanacname", "sysname")
-        or DEFAULT_WLAN_AC_NAME
-    )
+    ac_name = _drcom_ac_name(query, cfg_query, html, host)
     ac_ip = _qs_first(query, "wlanacip", "acip") or _qs_first(cfg_query, "wlanacip", "acip")
     accounts = _account_variants(username) if username else ["drcom"]
     last_message = "注销失败"
@@ -864,8 +1489,8 @@ def login_srun(session: requests.Session, url: str, html: str, username: str, pa
     return False, message or "深澜登录失败"
 
 
-def _guess_login_result(response: requests.Response) -> tuple[bool, str]:
-    text = response.text or ""
+def _guess_result_text(text: str, status_code: int = 200) -> tuple[bool, str]:
+    text = text or ""
     lowered = text.lower()
     success_tokens = ("登录成功", "login success", "auth success", "success\":true", '"result":"success"', "successfully")
     fail_tokens = ("密码错误", "账号错误", "用户不存在", "login fail", "auth fail", "password error", "失败")
@@ -873,6 +1498,10 @@ def _guess_login_result(response: requests.Response) -> tuple[bool, str]:
         return True, "登录成功"
     if any(token in lowered or token in text for token in fail_tokens):
         return False, "登录失败，请检查账号密码"
-    if response.status_code >= 400:
-        return False, f"登录请求失败 HTTP {response.status_code}"
-    return True, f"已提交登录（HTTP {response.status_code}），将再检测是否已联网"
+    if status_code >= 400:
+        return False, f"登录请求失败 HTTP {status_code}"
+    return True, f"已提交登录（HTTP {status_code}），将再检测是否已联网"
+
+
+def _guess_login_result(response: requests.Response) -> tuple[bool, str]:
+    return _guess_result_text(response.text or "", response.status_code)
