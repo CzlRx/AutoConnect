@@ -494,8 +494,9 @@ def run_login_loop(
         portal_url = cfg.normalized_portal_url()
         current_ips = adapters.campus_ipv4s()
         session = _rebind_session(session, current_ips[0] if current_ips else "")
-        # 先问网关在不在线：已经在线就别再登录（重复登录会把会话重置成"待放行"）
-        state = probe_gateway_online(cfg, session)
+        # 常州工学院的网关会在 80 端口回答在线状态。常州大学没有这个接口，
+        # 去问只会白等一次超时。
+        state = probe_gateway_online(cfg, session) if cfg.profile().portal_api_first else None
         if state is True:
             if wait_online(session=session, cfg=cfg):
                 return LoginResult(True, "已经在线（已确认可以上网）", "drcom")
@@ -519,7 +520,12 @@ def run_login_loop(
                 (time.perf_counter() - started) * 1000,
             )
             if last.ok:
-                # 网关说成功 ≠ 数据通道已通：实测能不能上外网（等它放行）
+                # 常州工学院的接口会先回成功、过一会儿才放行，所以要实测外网。
+                # 常州大学的 eportal 回「认证成功」就是已经登上了。这时如果还拿
+                # 绑定在校园网网卡上的连接去探测百度，Clash 的 fake-ip 会让探测全部超时，
+                # 把一次成功的登录报成失败。
+                if not cfg.profile().portal_api_first:
+                    return last
                 if wait_online(session=session, cfg=cfg):
                     return LoginResult(True, f"{last.message}（已确认可以上网）", last.adapter)
                 log.warning("网关已受理认证，但外网仍未放行")

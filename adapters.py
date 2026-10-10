@@ -409,6 +409,20 @@ def login_drcom_portal_api(
 
 def login_drcom(session: requests.Session, url: str, html: str, username: str, password: str) -> tuple[bool, str]:
     api_first = _portal_api_first()
+    # 常州大学走老式 /eportal/?c=Portal&a=login。80 端口的 /drcom/login 和
+    # /eportal/portal/login 是常州工学院的接口，打到常大上会超时或 404。
+    if not api_first:
+        ok, message = login_drcom_portal(session, url, html, username, password)
+        if ok or _looks_like_credential_error(message):
+            return ok, message
+        log.info("eportal 接口未成功: %s", message)
+        status = drcom_status_after_login(session, url, html)
+        if status is True:
+            return True, "已经在线"
+        if status is False:
+            message = f"{message}；回访确认仍未在线"
+        return False, message
+
     # 1) 现代门户接口：801 端口 /eportal/portal/login（常州工学院浏览器实际用的就是这个）
     if api_first:
         ok, message = login_drcom_portal_api(session, url, html, username, password)
@@ -683,7 +697,7 @@ def drcom_status_after_login(session: requests.Session, url: str, html: str) -> 
     parsed = urlparse(url)
     host = params.get("serip") or parsed.hostname
     scheme = parsed.scheme or "http"
-    if host:
+    if host and _portal_api_first():
         status_url = f"{scheme}://{host}/drcom/chkstatus"
         try:
             response = session.get(
@@ -707,13 +721,14 @@ def drcom_status_after_login(session: requests.Session, url: str, html: str) -> 
     text = _decode_body(response, params.get("charset", ""))
     if not text.strip():
         return None
-    if _contains_any(text, ("登录成功", "已经在线", "已在线", "logout", "注销", "退出")):
-        log.info("回访门户页显示已登录")
-        return True
-    if _drcom_login_page(text):
+    if _drcom_login_page(text) or _has_password_field(text):
         log.info("回访门户页仍是登录页")
         return False
-    return True
+    if _contains_any(text, ("登录成功", "成功登录", "已经在线", "已在线")):
+        log.info("回访门户页显示已登录")
+        return True
+    log.info("回访门户页无法判断是否在线")
+    return None
 
 
 def _js_assign(html: str, name: str) -> str:
